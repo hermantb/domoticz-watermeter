@@ -10,9 +10,8 @@
         <h3>Features</h3>
         <ul style="list-style-type:square">
             <li>Exports the pin (not necessary to do before starting domoticz)</li>
-            <li>Is  run from within domoticz (no need for making sure a seperate python scripts keeps up and running on your pi)</li>
+            <li>Is run from within domoticz (no need for making sure a seperate python scripts keeps up and running on your pi)</li>
             <li>Creates the watermeterdevice (no need for giving special http commands to create the needed device) </li>
-            <li>Allow for overriding the meter reading manually (change the meterstand.txt to the meterstand you need) </li>
         </ul>
         <h3>Devices</h3>
         <ul style="list-style-type:square">
@@ -22,9 +21,7 @@
         Configure correctly. The plugin works using the default settings, but your system might need different settings...
         <ul style="list-style-type:square">
             <li>GPIO Pin Number - The GPIO Pin (BCM!) to which your NPN sensor is connected. To avoid conflicts, make sure the GPIO pin is not managed/configured somewhere else on your system to prevent confllicts. You can still use the normal GPIO drivers in domoticz for other pins as long as you don't configure the same pins.</li>
-            <li>Debounce Time - Configure the cooldown time after the interrupt to prevent interrupt flooding. A high number is recommended, but it should be less then the time it takes to have 1 liter going throught your watermeter, to prevent lost measurements.</li> 
-            <li>Meter Reading File - The path of the file where you want the actual meter reading to be stored. If you do not specifiy a path, the homefolder of this plugin will be used</li>
-            <li>Increment - The amount your domoticz counter must be incremented when a pulse of the watermeter is detected. In NL this is normally 1 liter. In belgium apparently this is 2 ticks per liter (value should then be 0.5).</li>
+            <li>Debounce Time - Configure the cooldown time after the interrupt to prevent interrupt flooding. A high number is recommended, but it should be less then the time it takes to have 1 liter going throught your watermeter, to prevent lost measurements. Check domoticz log to see the water rate after water is consumed.</li> 
 
             <br/>
             Last but not least: A normal (Dutch) watermeter measures 1 liter every pulse on the GPIO pin. The meter in domoticz is of the type M3. So in order to have this meter to show the correct amount, you have to change the RFX Meter/Counter Setup in domoticz. If this is not set correctly: <br />
@@ -64,29 +61,7 @@
             <option label="GPIO26" value="26"/>
          </options>
          </param> 
-         <param field="Mode4" label="Debounce time (ms)" width="150px" required="true">
-         <options>
-            <option label="0" value="0" />
-            <option label="50" value="50" />
-            <option label="100" value="100" />
-            <option label="150" value="150" />
-            <option label="200" value="200" />
-            <option label="250" value="250" />
-            <option label="300" value="300" />
-            <option label="350" value="350" default="true"/>
-            <option label="400" value="400" />
-            <option label="450" value="450" />
-            <option label="500" value="500" />
-			<option label="750" value="500" />
-            <option label="1000" value="1000" />
-			<option label="1250" value="1250" />
-            <option label="1500" value="1500" />
-			<option label="1750" value="1750" />
-            <option label="2000" value="2000" />
-         </options>
-         </param>
-         <param field="Mode5" label="Meter Reading File" width="150px" required="true" default="meterstand_water.txt" />
-         <param field="Mode6" label="Increment" width="70px" default="1"/> 
+         <param field="Mode4" label="Debounce time (s)" width="150px" required="true" default="0.350"/>
      </params>
 </plugin>
 """
@@ -94,18 +69,7 @@ import Domoticz
 from gpiozero import Button
 import os
 import time
-
-#setup global vars
-#global debug
-#global fakereading
-
-fakereading=False        # for testing purposes. Will generate a "tick" every 10 seconds
-
-#Check if we have to go in debug mode
-debug=False #True/False             # set to true to enable debug logging
-#if os.path.exists(str(Parameters["HomeFolder"])+"DEBUG"): 
-
-last_watermeter_value = 0
+import datetime
 
 class BasePlugin:
 
@@ -114,106 +78,122 @@ class BasePlugin:
         return
 
     def onStart(self):
-        global debug
-        global fakereading
-        global gpio_pin
-        global meter
+        self.fakereading = False        # for testing purposes. Will generate a "tick" every 20 seconds
+
+        # Check if we have to go in debug mode
+        self.debug = False #True/False  # set to true to enable debug logging
+
+        # Used to limit write to disk
+        self.busy = False
+        self.delta = 0
+
+        #Used for debouncing
+        self.bouncetime = float(Parameters["Mode4"])
+        self.n_interrupt = 0
+        self.first_time = 0
+        self.last_time = 0
 
         Domoticz.Log("Watermeter plugin started...")
 
-        #Check if we have to switch on debug mode
+        # Check if we have to switch on debug mode
         if os.path.exists(str(Parameters["HomeFolder"])+"DEBUG"): 
-            debug=True
+            self.debug = True
             Domoticz.Log("File "+str(Parameters["HomeFolder"])+"DEBUG"+" exists, switching on Debug mode")
         else:
-            debug=False #True/False
+            self.debug = False #True/False
 
-        #Check if we have to switch on pulse for testin purposes
+        # Check if we have to switch on pulse for testin purposes
         if os.path.exists(str(Parameters["HomeFolder"])+"TESTPULSE"): 
-            fakereading=True
-            Domoticz.Log("Plugin is in testing mode, generates a tick every 10 seconds by itself!!, delete file "+str(Parameters["HomeFolder"])+"TESTPULSE to switch off")
+            self.fakereading = True
+            Domoticz.Log("Plugin is in testing mode, generates a tick every 20 seconds by itself!!, delete file "+str(Parameters["HomeFolder"])+"TESTPULSE to switch off")
         else:
-            fakereading=False
+            self.fakereading = False
 
 
-        Debug("OnStart called")
-		
-        if debug==True:
-            Debug("In Debug mode: Dumping config to log...") 
+        self.Debug("OnStart called")
+
+        if self.debug == True:
+            self.Debug("In Debug mode: Dumping config to log...") 
             DumpConfigToLog()
 
-        #get pin config from settings
+        # Get pin config from settings
         gpio_pin=int(Parameters["Mode1"])
 
-        Debug("Pin "+str(gpio_pin)+" was configured")
-
-        # By default false positive checks are switched OFF
-        check_last_value = False
-        check_consistency = False
-
-        fn=Parameters["Mode5"]
-        increment=float(Parameters["Mode6"])
-        Debug("Filename "+fn+" detected")
-        Debug("increment "+str(increment)+" detected")
-
+        self.Debug("Pin "+str(gpio_pin)+" was configured")
 
         # Setting up GPIO
-        Debug("Setting up GPIO")
-        meter=Button(gpio_pin)
-        meter.when_pressed = Interrupt
-        #meter.when_released= Interrupt
+        self.Debug("Setting up GPIO")
+        self.meter = Button(gpio_pin)
+        self.meter.when_pressed = self.Interrupt
+        #self.meter.when_released= self.Interrupt
 
-        #Create device if needed
+        # Create device if needed
         if (len(Devices) == 0):
-            Debug("Creating watermeter device")
-            Domoticz.Device(Name="Water Usage", Unit=1, Type=113, Subtype=0, Switchtype=2).Create()
-
-        #Get current counter
-        counter=GetMeterFile()
-        InitialReading=0
-        if counter==-1:
-            Debug("No meter file, creating one with value  ("+str(InitialReading)+")")
-            counter=InitialReading
-            WriteMeterFile(counter)
-
-        # Update Sensor with counter
-        Devices[1].Update(nValue=int(counter), sValue=str(counter))
-
+            self.Debug("Creating watermeter device")
+            Domoticz.Device(Name="Water Usage", Used=1, Unit=1, Type=113, Subtype=0, Switchtype=2).Create()
 
     def onStop(self):
-        global meter
-
-        Debug("onStop called")
-        del meter
+        self.Debug("onStop called")
+        self.meter.close()
+        del self.meter
 
     def onConnect(self, Connection, Status, Description):
-        Debug("onConnect called")
+        self.Debug("onConnect called")
 
     def onMessage(self, Connection, Data):
-        Debug("onMessage called")
+        self.Debug("onMessage called")
 
     def onCommand(self, Unit, Command, Level, Hue):
-        Debug("onCommand called for Unit " + str(Unit) + ": Parameter '" + str(Command) + "', Level: " + str(Level))
+        self.Debug("onCommand called for Unit " + str(Unit) + ": Parameter '" + str(Command) + "', Level: " + str(Level))
 
     def onNotification(self, Name, Subject, Text, Status, Priority, Sound, ImageFile):
-        Debug("Notification: " + Name + "," + Subject + "," + Text + "," + Status + "," + str(Priority) + "," + Sound + "," + ImageFile)
+        self.Debug("Notification: " + Name + "," + Subject + "," + Text + "," + Status + "," + str(Priority) + "," + Sound + "," + ImageFile)
 
     def onDisconnect(self, Connection):
-        Debug("onDisconnect called")
+        self.Debug("onDisconnect called")
 
     def onHeartbeat(self):
-        global last_watermeter_value
-        Debug("onHeartbeat called")
-        if fakereading==True:
-            Debug("FakeReading==True: Generating testpulse, not generated by watermeter itself!")
-            Interrupt(1) #For testing purposes
+        self.Debug("onHeartbeat called")
+        if self.fakereading == True and self.delta == 0:
+            self.Debug("FakeReading==True: Generating testpulse, not generated by watermeter itself!")
+            self.Interrupt(1) #For testing purposes
 
-        #Logging (Wordaround: domotic 2022.1 cause error in findmodule if log function is called during interrupt, so log in heartbeat if value has changed)
-        counter=GetMeterFile()
-        if last_watermeter_value!=counter:
-            Domoticz.Log("RFXMeter/RFXMeter counter ("+Devices[1].Name+") - "+str(counter/1000)+" M3") 
-            last_watermeter_value=counter
+        # Do not write every time. This will destroy ssd drives.
+        if self.busy == True:
+            self.busy = False
+        elif self.delta != 0:
+            # Create device if it is no longer there
+            if (len(Devices) == 0):
+                self.Debug("Watermeter device gone...Creating watermeter device")
+                Domoticz.Device(Name="Water Usage", Used=1, Unit=1, Type=113, Subtype=0, Switchtype=2).Create()
 
+            # Update the device with the found delta
+            rate = 0
+            if self.delta != 1:
+                rate = round((self.last_time - self.first_time) / (self.delta - 1) * 1000) / 1000
+            text = "RFXMeter/RFXMeter counter ("+Devices[1].Name+") - " + str(self.delta) + " Liter. Rate " + str(rate) + " Seconds/Liter. Interrupts " + str(self.n_interrupt)
+            Domoticz.Log(text)
+            if (self.debug):
+                with open ("meterstand_water.log", 'a') as f:
+                    f.write(str(datetime.datetime.now()) + " " + text + "\n")
+            counter = Devices[1].nValue + self.delta
+            self.delta = 0
+            self.n_interrupt = 0
+            Devices[1].Update(nValue=int(counter), sValue=str(counter))
+
+    def Interrupt(self, channel):
+        self.n_interrupt = self.n_interrupt + 1
+        self.busy = True
+        cur_time = time.time()
+        if (cur_time - self.last_time) > self.bouncetime:
+            if self.delta == 0:
+                self.first_time = cur_time
+            self.delta = self.delta + 1 # Add 1 liter
+        self.last_time = cur_time
+
+    def Debug(self, text):
+        if (self.debug):
+            Domoticz.Log(text)
 
 global _plugin
 _plugin = BasePlugin()
@@ -264,56 +244,3 @@ def DumpConfigToLog():
         Domoticz.Log("Device sValue:   '" + Devices[x].sValue + "'")
         Domoticz.Log("Device LastLevel: " + str(Devices[x].LastLevel))
     return
-
-def GetMeterFile():
-    fn=Parameters["Mode5"] # Get filename
-    Debug("GetMeterFile() called")
-    if os.path.exists(fn):
-        f = open(fn, "r+")
-        line = f.readline()
-        a,b,c = line.split()
-        Counter = float(c)
-        Debug("Meter file exists, current counter is "+str(Counter))
-        return Counter
-    else:
-        Debug("No Meter File found")
-        return -1
-
-def WriteMeterFile(counter):
-    fn=Parameters["Mode5"] # get Filename
-    Debug("WriteMeterFile("+str(counter)+") called")
-    f = open( fn, 'w')
-    f.write( 'meterstand = ' + repr(counter))
-    f.close()
-
-def Interrupt(channel):
-
-    global interrupt
-    global gpio_pin
-
-    Debug("Processing Meter Pulse (1 liter water)")
-
-    counter=GetMeterFile()
-    if counter==-1:
-        # counter=int(Parameters["Mode6"]) # Get initial value from settings
-        counter=0 # Configured above in the script
-        Debug("No meter file, creating a new one")
-    else:
-        increment=float(Parameters["Mode6"])
-        counter+=increment 
-        Debug("incremented counter to "+str(counter))
-
-    WriteMeterFile(counter)
-
-    #Create device if it is no longer there 
-    if (len(Devices) == 0): 
-        Debug("Watermeter device gone...Creating watermeter device")
-        Domoticz.Device(Name="Water Usage", Unit=1, Type=113, Subtype=0, Switchtype=2).Create()
-    
-    #update the device with the found counter
-    Devices[1].Update(nValue=int(counter), sValue=str(counter))
-    #Domoticz.Log("RFXMeter/RFXMeter counter ("+Devices[1].Name+") - "+str(counter/1000)+" M3") ## temporarily disabled due to FindModule bug
-
-def Debug(text):
-    if (debug):
-        Domoticz.Log(text)
